@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""
+Yellowscribe middleman — local relay + page.
+
+Yellowscribe's server doesn't send CORS headers, so a browser page can't call
+it directly. This script serves the page (embedded below) and relays two calls to Yellowscribe:
+
+  GET  /api/army?id=CODE      -> GET  {UPSTREAM}/get_army_by_id?id=CODE
+  POST /api/code?<params>     -> POST {UPSTREAM}/getArmyCode?<params>   (body passed through)
+
+Run:   python3 server.py            then open http://localhost:8040
+Env:   PORT (default 8040), YELLOWSCRIBE_URL (default https://yellowscribe.link)
+
+Standard library only — no installs needed.
+"""
+import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+PORT = int(os.environ.get("PORT", "8040"))
+UPSTREAM = os.environ.get("YELLOWSCRIBE_URL", "https://yellowscribe.link").rstrip("/")
+HERE = Path(__file__).resolve().parent
+
+# The page is embedded so this is a single file. If an index.html sits next to
+# this script, that is served instead (handy for editing the page).
+PAGE = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Yellowscribe Middleman</title>
+<style>
+  :root {
+    --bg: #14130f; --panel: #1d1b16; --panel-2: #26231c; --line: #38342a;
+    --ink: #ece6d6; --muted: #a39b86; --accent: #f2c230; --accent-ink: #1a1605;
+    --bad: #ff7a6b; --good: #8fd18a;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 var(--sans); }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: .02em; }
+  h1 b { color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+
+  form.load { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=text] {
+    flex: 1 1 220px; background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font: 16px var(--mono); letter-spacing: .08em;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button {
+    background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 8px;
+    padding: 10px 18px; font-weight: 600; font-size: 15px; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: progress; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 500; }
+
+  #status { min-height: 22px; margin: 12px 0 4px; font-size: 14px; color: var(--muted); }
+  #status.err { color: var(--bad); }
+  #status.ok { color: var(--good); }
+
+  .summary { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 14px 0 18px; padding: 12px 14px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; font-size: 14px; }
+  .summary span { color: var(--muted); }
+  .summary strong { color: var(--ink); font-weight: 600; }
+
+  details.unit { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin: 0 0 10px; }
+  details.unit > summary { list-style: none; cursor: pointer; padding: 12px 14px; display: flex; align-items: baseline; gap: 10px; }
+  details.unit > summary::-webkit-details-marker { display: none; }
+  details.unit > summary::before { content: "▸"; color: var(--accent); transition: transform .15s; display: inline-block; }
+  details.unit[open] > summary::before { transform: rotate(90deg); }
+  .uname { font-weight: 650; font-size: 16px; }
+  .ucount { color: var(--muted); font-size: 13px; margin-left: auto; white-space: nowrap; }
+  .body { padding: 0 14px 14px; }
+
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .09em; color: var(--accent); margin: 16px 0 6px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; background: var(--panel-2); }
+  td.n, th.n { text-align: center; font-family: var(--mono); white-space: nowrap; }
+  td.kw { color: var(--muted); font-size: 12.5px; }
+
+  .ability { padding: 8px 10px; background: var(--panel-2); border-radius: 8px; margin: 0 0 6px; }
+  .ability b { display: block; margin-bottom: 2px; }
+  .ability p { margin: 0; white-space: pre-wrap; color: #d6cfbd; font-size: 13.5px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .chip.f { border-color: #6b5a1c; color: var(--accent); }
+  ul.comp { margin: 0; padding-left: 18px; }
+  ul.comp li { margin: 2px 0; }
+  ul.comp small { color: var(--muted); }
+
+  .tools { display: flex; gap: 8px; flex-wrap: wrap; margin: 24px 0 8px; }
+  details.extra { margin-top: 10px; }
+  details.extra summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+  textarea { width: 100%; min-height: 160px; margin-top: 8px; background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: 12.5px/1.4 var(--mono); }
+  pre.raw { max-height: 420px; overflow: auto; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px; font: 12px/1.4 var(--mono); margin: 8px 0 0; }
+  .empty { color: var(--muted); }
+
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 2px; }
+  button.toggle { background: transparent; color: var(--ink); border: 1px solid var(--line); font-weight: 500; font-size: 13.5px; padding: 7px 12px; }
+  button.toggle[aria-pressed=true] { background: #3a3110; border-color: var(--accent); color: var(--accent); }
+  .badge { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent-ink); background: var(--accent); border-radius: 4px; padding: 1px 6px; }
+  .ability.added { outline: 1px solid var(--accent); }
+  .ability.added b::after { content: " · added"; color: var(--accent); font-weight: 500; font-size: 12px; }
+
+  .export { position: sticky; bottom: 0; margin: 18px -16px 0; padding: 12px 16px; background: rgba(20,19,15,.96);
+    border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+  .export .info { color: var(--muted); font-size: 14px; flex: 1 1 200px; }
+  .newcode { display: flex; align-items: center; gap: 8px; }
+  .newcode code { font: 600 20px var(--mono); color: var(--accent); letter-spacing: .1em; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; }
+  .newcode small { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1><b>Yellowscribe</b> Middleman</h1>
+  <p class="sub">Enter a Yellowscribe code to pull the army list. Codes expire about 10 minutes after Yellowscribe makes them.</p>
+
+  <form class="load" id="loadForm">
+    <input type="text" id="code" placeholder="e.g. 1a2b3c4d" autocomplete="off" spellcheck="false" aria-label="Yellowscribe code">
+    <button type="submit" id="loadBtn">Load army</button>
+  </form>
+  <div id="status" role="status"></div>
+
+  <div id="army"></div>
+
+  <div class="export" id="export" hidden>
+    <div class="info" id="exportInfo">No changes yet.</div>
+    <div class="newcode" id="newCode" hidden></div>
+    <button type="button" id="exportBtn">Get new code</button>
+  </div>
+
+  <div class="tools" id="tools" hidden>
+    <button class="ghost" type="button" id="expandAll">Expand all</button>
+    <button class="ghost" type="button" id="collapseAll">Collapse all</button>
+  </div>
+
+  <details class="extra" id="rawWrap" hidden>
+    <summary>Raw JSON from Yellowscribe</summary>
+    <pre class="raw" id="raw"></pre>
+  </details>
+
+  <details class="extra">
+    <summary>No server? Paste the JSON instead</summary>
+    <p class="sub" style="margin:8px 0 0">Open <code>https://yellowscribe.link/get_army_by_id?id=YOURCODE</code> in a browser tab, copy everything, paste it here.</p>
+    <textarea id="paste" placeholder='{"edition":"11e","order":[...],"armyData":{...}}'></textarea>
+    <button type="button" id="pasteBtn" style="margin-top:8px">Show pasted army</button>
+  </details>
+</main>
+
+<script>
+// ---- State: the raw Yellowscribe response is kept intact so later steps can
+// modify it (e.g. add abilities) and POST it back for a new code. ----
+const state = { code: null, army: null, timer: null };
+
+// The ability the button adds. Yellowscribe stores unit abilities as
+// {name: {name, desc}} (shown on the TTS datacard) and each model's abilities
+// as a list of names (shown in the model's description) — we update both.
+const REROLL = {
+  name: "Re-roll 1s to Hit",
+  desc: "Each time a model in this unit makes an attack, you can re-roll a Hit roll of 1.",
+};
+
+const hasAbility = (unit, name) => !!(unit.abilities && unit.abilities[name]);
+
+function setAbility(unit, ability, on) {
+  unit.abilities = unit.abilities || {};
+  const models = Object.values(unit.models?.models || {});
+  if (on) {
+    unit.abilities[ability.name] = { name: ability.name, desc: ability.desc };
+    for (const m of models) {
+      m.abilities = Array.isArray(m.abilities) ? m.abilities : [];
+      if (!m.abilities.includes(ability.name)) m.abilities.push(ability.name);
+    }
+  } else {
+    delete unit.abilities[ability.name];
+    for (const m of models) if (Array.isArray(m.abilities)) m.abilities = m.abilities.filter(n => n !== ability.name);
+  }
+}
+
+const editedUnits = () => Object.values(state.army?.armyData || {}).filter(u => hasAbility(u, REROLL.name));
+
+const $ = id => document.getElementById(id);
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v; else if (k === "text") n.textContent = v; else n.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) n.append(k);
+  return n;
+};
+
+// TTS text can carry BBCode colour/format tags like [FFCC00]...[-] or [b]...[/b]
+const clean = s => String(s ?? "").replace(/\\"/g, '"').replace(/\[(?:[0-9A-Fa-f]{6}|-|\/?[bius]|\/?sup|\/?sub)\]/g, "");
+
+function setStatus(msg, kind = "") { const s = $("status"); s.textContent = msg; s.className = kind; }
+
+// Accept a bare code, or a pasted URL containing ?id=CODE
+function extractCode(input) {
+  const t = input.trim();
+  const m = t.match(/[?&]id=([0-9a-fA-F]{8})/) || t.match(/^([0-9a-fA-F]{8})$/);
+  return m ? m[1].toLowerCase() : null;
+}
+
+async function loadByCode(code) {
+  $("loadBtn").disabled = true;
+  setStatus(`Fetching ${code}…`);
+  try {
+    const r = await fetch(`/api/army?id=${encodeURIComponent(code)}`);
+    let data;
+    try { data = await r.json(); } catch { throw new Error(`Yellowscribe sent something that isn't JSON (HTTP ${r.status}).`); }
+    if (!r.ok || data.err) throw new Error(data.err || `HTTP ${r.status}`);
+    state.code = code;
+    showArmy(data);
+    setStatus(`Loaded ${code}.`, "ok");
+  } catch (e) {
+    const offline = e instanceof TypeError; // fetch itself failed: page not served by server.py
+    setStatus(offline ? "Can't reach the local relay — is server.py running? (Or use the paste option below.)" : e.message, "err");
+  } finally {
+    $("loadBtn").disabled = false;
+  }
+}
+
+function showArmy(data) {
+  if (!data || typeof data.armyData !== "object") throw new Error("That JSON has no armyData — is it a Yellowscribe army?");
+  state.army = data;
+  render();
+}
+
+// Which TTS script modules were used, so we can ask for the same ones when re-coding.
+function detectModules(army) {
+  const s = army.baseScript || "";
+  const mods = ["MatchedPlay"];
+  if (/--\[\[9\]\]\s*showCrusadeCard/.test(s)) mods.push("Crusade");
+  return mods;
+}
+
+// Columns are shown only when some row has them, so 10e/11e (M T SV W LD OC INV)
+// and older 9e lists (M WS BS S T W A LD SV) both render properly.
+const present = (list, cols) => cols.filter(([k]) => list.some(r => r[k] != null && r[k] !== "" && !(k === "insv" && r[k] === "-")));
+
+function statsTable(profiles) {
+  const list = Object.values(profiles || {});
+  if (!list.length) return null;
+  const use = present(list, [["m","M"],["ws","WS"],["bs","BS"],["s","S"],["t","T"],["sv","SV"],["w","W"],["a","A"],["ld","LD"],["oc","OC"],["insv","INV"]]);
+  return el("div", { class: "scroll" }, el("table", {},
+    el("thead", {}, el("tr", {}, el("th", { text: "Model" }), ...use.map(([,h]) => el("th", { class: "n", text: h })))),
+    el("tbody", {}, ...list.map(p => el("tr", {},
+      el("td", { text: clean(p.name) }),
+      ...use.map(([k]) => el("td", { class: "n", text: clean(p[k] ?? "-") })))))));
+}
+
+function weaponTable(weapons, melee) {
+  const list = weapons.filter(w => (w.range === "Melee") === melee);
+  if (!list.length) return null;
+  const use = present(list, [["range","Range"],["type","Type"],["a","A"],["bsws", melee ? "WS" : "BS"],["s","S"],["ap","AP"],["d","D"]]);
+  return el("div", { class: "scroll" }, el("table", {},
+    el("thead", {}, el("tr", {},
+      el("th", { text: melee ? "Melee weapon" : "Ranged weapon" }),
+      ...use.map(([,h]) => el("th", { class: "n", text: h })), el("th", { text: "Keywords" }))),
+    el("tbody", {}, ...list.map(w => el("tr", {},
+      el("td", { text: clean(w.name) }),
+      ...use.map(([k]) => el("td", { class: "n", text: clean(w[k] ?? "-") })),
+      el("td", { class: "kw", text: clean(w.abilities && w.abilities !== "-" ? w.abilities : "") }))))));
+}
+
+function unitCard(unit) {
+  const models = Object.values(unit.models?.models || {});
+  const total = unit.models?.totalNumberOfModels ?? models.reduce((n, m) => n + (m.number || 0), 0);
+  const weapons = Object.values(unit.weapons || {});
+  const abilities = Object.values(unit.abilities || {});
+
+  const on = hasAbility(unit, REROLL.name);
+  const toggle = el("button", { type: "button", class: "toggle", "aria-pressed": String(on),
+    text: on ? "✓ Re-roll 1s to Hit (click to remove)" : "+ Re-roll 1s to Hit" });
+  toggle.addEventListener("click", () => {
+    setAbility(unit, REROLL, !hasAbility(unit, REROLL.name));
+    const fresh = unitCard(unit);
+    fresh.open = true;
+    card.replaceWith(fresh);
+    changed();
+  });
+
+  const body = el("div", { class: "body" }, el("div", { class: "actions" }, toggle));
+  const stats = statsTable(unit.modelProfiles);
+  if (stats) body.append(el("h3", { text: "Profile" }), stats);
+  const rw = weaponTable(weapons, false), mw = weaponTable(weapons, true);
+  if (rw || mw) body.append(el("h3", { text: "Weapons" }), rw || "", mw ? el("div", { style: rw ? "margin-top:8px" : "" }, mw) : "");
+
+  body.append(el("h3", { text: "Abilities" }));
+  if (abilities.length) for (const a of abilities)
+    body.append(el("div", { class: a.name === REROLL.name ? "ability added" : "ability" }, el("b", { text: clean(a.name) }), el("p", { text: clean(a.desc) })));
+  else body.append(el("p", { class: "empty", text: "None listed." }));
+
+  if (models.length) {
+    body.append(el("h3", { text: "Composition" }), el("ul", { class: "comp" }, ...models.map(m => el("li", {},
+      `${m.number}× ${clean(m.name)}`,
+      (m.weapons?.length) ? el("small", { text: " — " + m.weapons.map(w => (w.number > 1 ? w.number + "× " : "") + clean(w.name)).join(", ") }) : null))));
+  }
+
+  const fk = unit.factionKeywords || [], kw = unit.keywords || [];
+  if (fk.length || kw.length) body.append(el("h3", { text: "Keywords" }),
+    el("div", { class: "chips" }, ...fk.map(k => el("span", { class: "chip f", text: clean(k) })), ...kw.map(k => el("span", { class: "chip", text: clean(k) }))));
+
+  const card = el("details", { class: "unit", "data-uuid": unit.uuid || "" },
+    el("summary", {}, el("span", { class: "uname", text: clean(unit.name) }),
+      on ? el("span", { class: "badge", text: "Re-roll 1s" }) : null,
+      el("span", { class: "ucount", text: `${total} model${total === 1 ? "" : "s"}` })),
+    body);
+  return card;
+}
+
+// Any edit makes a previously issued code out of date.
+function changed() {
+  const n = editedUnits().length;
+  $("exportInfo").textContent = n ? `Re-roll 1s added to ${n} unit${n === 1 ? "" : "s"}.` : "No changes yet — you can still re-issue the same list.";
+  clearNewCode();
+}
+
+function clearNewCode() {
+  clearInterval(state.timer);
+  $("newCode").hidden = true;
+  $("newCode").replaceChildren();
+}
+
+// Send the (edited) army back to Yellowscribe for a fresh code, using the same
+// TTS settings and script modules as the original code.
+async function exportArmy() {
+  const a = state.army;
+  const params = new URLSearchParams({
+    uiHeight: String(a.uiHeight ?? "700"),
+    uiWidth: String(a.uiWidth ?? "1200"),
+    decorativeNames: String(a.decorativeNames ?? "false"),
+    modules: detectModules(a).join(","),
+  });
+  const body = JSON.stringify({ edition: a.edition, order: a.order, units: a.armyData });
+  $("exportBtn").disabled = true;
+  setStatus("Asking Yellowscribe for a new code…");
+  try {
+    const r = await fetch(`/api/code?${params}`, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    let data;
+    try { data = await r.json(); } catch { throw new Error(`Yellowscribe sent something that isn't JSON (HTTP ${r.status}).`); }
+    if (!r.ok || data.err || !data.code) throw new Error(data.err ? clean(data.err).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() : `HTTP ${r.status}`);
+    showNewCode(data.code);
+    setStatus(`New code ready: ${data.code}`, "ok");
+  } catch (e) {
+    setStatus(e instanceof TypeError ? "Can't reach the local relay — is the script running?" : e.message, "err");
+  } finally {
+    $("exportBtn").disabled = false;
+  }
+}
+
+function showNewCode(code) {
+  clearNewCode();
+  const expires = Date.now() + 10 * 60 * 1000;
+  const left = el("small");
+  const copy = el("button", { type: "button", class: "ghost", text: "Copy" });
+  copy.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(code); copy.textContent = "Copied"; }
+    catch { copy.textContent = "Select & copy"; }
+    setTimeout(() => copy.textContent = "Copy", 1500);
+  });
+  const tick = () => {
+    const s = Math.max(0, Math.round((expires - Date.now()) / 1000));
+    left.textContent = s ? `expires in ~${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : "probably expired — get another";
+    if (!s) clearInterval(state.timer);
+  };
+  $("newCode").replaceChildren(el("code", { text: code }), copy, left);
+  $("newCode").hidden = false;
+  tick();
+  state.timer = setInterval(tick, 1000);
+}
+
+function render() {
+  const army = state.army, root = $("army");
+  root.replaceChildren();
+  const units = army.armyData || {};
+  const order = (army.order && army.order.length ? army.order : Object.keys(units)).filter(id => units[id]);
+  const totalModels = order.reduce((n, id) => n + (units[id].models?.totalNumberOfModels || 0), 0);
+
+  root.append(el("div", { class: "summary" },
+    el("div", {}, el("span", { text: "Code " }), el("strong", { text: state.code || "pasted" })),
+    el("div", {}, el("span", { text: "Edition " }), el("strong", { text: army.edition || "?" })),
+    el("div", {}, el("span", { text: "Units " }), el("strong", { text: String(order.length) })),
+    el("div", {}, el("span", { text: "Models " }), el("strong", { text: String(totalModels) })),
+    el("div", {}, el("span", { text: "Modules " }), el("strong", { text: detectModules(army).join(", ") }))));
+
+  for (const id of order) root.append(unitCard(units[id]));
+
+  $("tools").hidden = false;
+  $("rawWrap").hidden = false;
+  $("export").hidden = false;
+  changed();
+  const { baseScript, ...rest } = army; // the Lua script is huge and not interesting to read
+  $("raw").textContent = JSON.stringify({ ...rest, baseScript: baseScript ? `<${baseScript.length} chars of Lua>` : baseScript }, null, 2);
+}
+
+// ---- Wiring ----
+$("loadForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const code = extractCode($("code").value);
+  if (!code) return setStatus("Codes are 8 characters, 0–9 and a–f.", "err");
+  $("code").value = code;
+  loadByCode(code);
+});
+$("pasteBtn").addEventListener("click", () => {
+  try { state.code = null; showArmy(JSON.parse($("paste").value)); setStatus("Showing pasted army.", "ok"); }
+  catch (e) { setStatus("Couldn't read that: " + e.message, "err"); }
+});
+$("exportBtn").addEventListener("click", exportArmy);
+$("expandAll").addEventListener("click", () => document.querySelectorAll("details.unit").forEach(d => d.open = true));
+$("collapseAll").addEventListener("click", () => document.querySelectorAll("details.unit").forEach(d => d.open = false));
+
+// Allow http://localhost:8040/?id=CODE to load straight away
+const initial = extractCode(location.search);
+if (initial) { $("code").value = initial; loadByCode(initial); }
+</script>
+</body>
+</html>
+'''
+CODE_RE = re.compile(r"^[0-9a-fA-F]{8}$")  # Yellowscribe codes are 8 hex chars
+ALLOWED_POST_PARAMS = {"uiHeight", "uiWidth", "decorativeNames", "modules"}
+TIMEOUT = 20
+# yellowscribe.link refuses Python's default "Python-urllib" User-Agent (HTTP 403),
+# so present as an ordinary browser.
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-GB,en;q=0.9",
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "YellowscribeMiddleman/1.0"
+
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _err(self, code, msg):
+        import json
+        self._send(code, json.dumps({"err": msg}))
+
+    def _upstream(self, req):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                self._send(r.status, r.read(), r.headers.get("Content-Type", "application/json"))
+        except urllib.error.HTTPError as e:
+            # Yellowscribe returns JSON {"err": ...} bodies on 404/500 — pass them on.
+            # Anything else (e.g. a block page on 403) gets wrapped in a readable message.
+            body = e.read() or b""
+            if body.lstrip()[:1] == b"{":
+                return self._send(e.code, body)
+            print(f"Upstream HTTP {e.code}; first bytes: {body[:300]!r}")
+            self._err(e.code, f"Yellowscribe refused the request (HTTP {e.code}). "
+                              "See the server window for details, or use the paste option.")
+        except Exception as e:  # network, timeout, DNS…
+            self._err(502, f"Couldn't reach Yellowscribe: {e}")
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        if url.path in ("/", "/index.html"):
+            page = HERE / "index.html"
+            body = page.read_bytes() if page.exists() else PAGE.encode("utf-8")
+            return self._send(200, body, "text/html; charset=utf-8")
+        if url.path == "/api/army":
+            code = urllib.parse.parse_qs(url.query).get("id", [""])[0].strip()
+            if not CODE_RE.match(code):
+                return self._err(400, "That doesn't look like a Yellowscribe code (8 characters, 0-9 and a-f).")
+            req = urllib.request.Request(f"{UPSTREAM}/get_army_by_id?id={code}", headers=HEADERS)
+            return self._upstream(req)
+        self._err(404, "Not found")
+
+    def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        if url.path == "/api/code":
+            params = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items() if k in ALLOWED_POST_PARAMS}
+            params.setdefault("modules", "MatchedPlay")
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 5_000_000:
+                return self._err(400, "Missing or oversized army body.")
+            body = self.rfile.read(length)
+            req = urllib.request.Request(
+                f"{UPSTREAM}/getArmyCode?{urllib.parse.urlencode(params)}",
+                data=body, method="POST", headers={**HEADERS, "Content-Type": "application/json"})
+            return self._upstream(req)
+        self._err(404, "Not found")
+
+    def log_message(self, fmt, *args):
+        print(f"[{self.log_date_time_string()}] {fmt % args}")
+
+
+if __name__ == "__main__":
+    print(f"Yellowscribe middleman on http://localhost:{PORT}  (upstream: {UPSTREAM})")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
